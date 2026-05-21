@@ -1,5 +1,7 @@
 #Requires -Version 5.1
-#Requires -Modules @{ModuleName="PnP.PowerShell"; ModuleVersion="2.0"}
+# NOTE : PnP.PowerShell ou Microsoft.Graph requis — détection automatique au démarrage.
+# Pour installer : Install-Module PnP.PowerShell -MinimumVersion 2.0 -Scope CurrentUser
+#                  Install-Module Microsoft.Graph -Scope CurrentUser
 
 <#
 .SYNOPSIS
@@ -23,13 +25,14 @@
     Exports disponibles : console colorée, CSV et rapport HTML interactif.
 
 .PARAMETER TenantId
-    Identifiant du tenant Azure AD (GUID ou domaine : contoso.onmicrosoft.com).
+    Domaine du tenant Microsoft 365 (ex: contoso.onmicrosoft.com).
+    IMPORTANT : Fournir le domaine, pas le GUID, pour la résolution des URLs SharePoint.
 
 .PARAMETER ClientId
-    Application ID (Client ID) de l'application Azure AD enregistrée.
+    Application ID (Client ID) de l'application Azure AD enregistrée (format GUID).
 
 .PARAMETER ClientSecret
-    Secret client de l'application Azure AD (SecureString recommandé).
+    Secret client de l'application Azure AD.
 
 .PARAMETER OutputPath
     Dossier de destination pour les exports CSV et HTML. Par défaut : répertoire courant.
@@ -40,9 +43,6 @@
 .PARAMETER AnonymousOnly
     Switch : ne rapporter que les liens "Anyone" (partages anonymes).
 
-.PARAMETER Verbose
-    Switch natif PowerShell : affiche les messages de diagnostic détaillés.
-
 .EXAMPLE
     .\Get-ShareAudit.ps1 -TenantId "contoso.onmicrosoft.com" -ClientId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -ClientSecret "votre_secret"
 
@@ -51,7 +51,7 @@
 
 .NOTES
     Auteur      : Ayi NEDJIMI — ayinedjimi-consultants.fr
-    Version     : 2.0.0
+    Version     : 2.1.0
     Création    : 2026-05-21
     Licence     : MIT
 
@@ -59,15 +59,19 @@
     pour lesquels vous disposez des autorisations légales et contractuelles appropriées.
 
     Permissions requises sur l'application Azure AD :
-      - Sites.Read.All (Application)
-      - Files.Read.All (Application)
-      - User.Read.All  (Application)
+      - Sites.Read.All       (Application)
+      - Files.Read.All       (Application)
+      - User.Read.All        (Application)
       - SharePoint > Full Control (si PnP.PowerShell en mode app-only)
 
     Throttling : Le script gère automatiquement les erreurs HTTP 429 avec back-off exponentiel.
 
-    Article de référence :
-    https://ayinedjimi-consultants.fr/articles/audit-partages-sharepoint-onedrive-powershell-anonymes
+    Ressources complémentaires :
+      - Guide complet        : https://ayinedjimi-consultants.fr/articles/audit-partages-sharepoint-onedrive-powershell-anonymes
+      - Audit Microsoft 365  : https://ayinedjimi-consultants.fr/articles/audit-securite-microsoft-365-guide
+      - Forensique M365      : https://ayinedjimi-consultants.fr/articles/forensique-microsoft-365-unified-audit-log
+      - Gouvernance Entra ID : https://ayinedjimi-consultants.fr/articles/entra-id-azure-ad-securite-configuration
+      - Identity Governance  : https://ayinedjimi-consultants.fr/articles/identity-governance-iga-cycle-vie-comptes
 
 .LINK
     https://github.com/ayinedjimi/sharepoint-onedrive-share-audit
@@ -75,11 +79,11 @@
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [Parameter(Mandatory = $true, HelpMessage = "ID ou domaine du tenant Azure AD")]
+    [Parameter(Mandatory = $true, HelpMessage = "Domaine du tenant (ex: contoso.onmicrosoft.com)")]
     [ValidateNotNullOrEmpty()]
     [string]$TenantId,
 
-    [Parameter(Mandatory = $true, HelpMessage = "Client ID de l'application Azure AD")]
+    [Parameter(Mandatory = $true, HelpMessage = "Client ID (GUID) de l'application Azure AD")]
     [ValidatePattern('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')]
     [string]$ClientId,
 
@@ -103,7 +107,7 @@ $ErrorActionPreference = "Stop"
 # SECTION 0 : CONSTANTES ET INITIALISATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-$Script:Version        = "2.0.0"
+$Script:Version        = "2.1.0"
 $Script:StartTime      = Get-Date
 $Script:LogEntries     = [System.Collections.Generic.List[string]]::new()
 $Script:SharingResults = [System.Collections.Generic.List[PSObject]]::new()
@@ -147,8 +151,8 @@ function Write-AuditLog {
         'DEBUG'   { 'Gray' }
     }
 
-    # Les messages DEBUG ne s'affichent qu'en mode Verbose
-    if ($Level -eq 'DEBUG' -and -not $VerbosePreference -eq 'Continue') { return }
+    # BUG FIX : précédence de -not corrigée (was: -not $Var -eq 'Value')
+    if ($Level -eq 'DEBUG' -and ($VerbosePreference -ne 'Continue')) { return }
 
     Write-Host $entry -ForegroundColor $color
 }
@@ -159,6 +163,7 @@ function Invoke-WithRetry {
     .DESCRIPTION
         Gère les codes 429 (Too Many Requests) et 503 (Service Unavailable) avec
         un back-off exponentiel : 2s, 4s, 8s, 16s, 32s maximum.
+        Les erreurs non-throttling (auth, permission) ne sont PAS retentées.
     #>
     param(
         [Parameter(Mandatory)]
@@ -171,7 +176,7 @@ function Invoke-WithRetry {
 
     while ($attempt -lt $Script:MaxRetries) {
         try {
-            return & $ScriptBlock
+            return (& $ScriptBlock)
         }
         catch {
             $attempt++
@@ -185,15 +190,22 @@ function Invoke-WithRetry {
                 $statusCode = if ($_.Exception.Message -match '429') { 429 } else { 503 }
             }
 
+            # Erreurs non-récupérables : on n'attend pas, on abandonne immédiatement
+            if ($statusCode -in 401, 403) {
+                Write-AuditLog "Erreur d'autorisation ($statusCode) pour '$OperationName' — vérifiez les permissions Azure AD." 'ERROR'
+                $Script:Stats.Errors++
+                return $null
+            }
+
             # Throttling : on attend et on réessaie
             if ($statusCode -in 429, 503) {
-                Write-AuditLog "Throttling détecté ($statusCode) pour '$OperationName'. Tentative $attempt/$Script:MaxRetries. Attente ${delay}s..." 'WARN'
+                Write-AuditLog "Throttling ($statusCode) pour '$OperationName'. Tentative $attempt/$Script:MaxRetries. Attente ${delay}s..." 'WARN'
                 Start-Sleep -Seconds $delay
-                $delay = [Math]::Min($delay * 2, 60)  # cap à 60s
+                $delay = [Math]::Min($delay * 2, 60)
                 continue
             }
 
-            # Autre erreur : on abandonne après MaxRetries tentatives
+            # Dépassement du nombre de tentatives
             if ($attempt -ge $Script:MaxRetries) {
                 Write-AuditLog "ÉCHEC définitif de '$OperationName' après $attempt tentatives : $_" 'ERROR'
                 $Script:Stats.Errors++
@@ -205,11 +217,15 @@ function Invoke-WithRetry {
             $delay = [Math]::Min($delay * 2, 60)
         }
     }
+
+    Write-AuditLog "Nombre maximum de tentatives atteint pour '$OperationName'." 'ERROR'
+    $Script:Stats.Errors++
+    return $null
 }
 
 function Test-ModuleAvailable {
     <#
-    .SYNOPSIS Vérifie si un module PowerShell est disponible et le charge si possible.
+    .SYNOPSIS Vérifie si un module PowerShell est disponible.
     #>
     param([string]$ModuleName, [string]$MinVersion = "")
 
@@ -219,7 +235,8 @@ function Test-ModuleAvailable {
                    Where-Object { [version]$_.Version -ge [version]$MinVersion } |
                    Sort-Object Version -Descending |
                    Select-Object -First 1
-        } else {
+        }
+        else {
             $mod = Get-Module -Name $ModuleName -ListAvailable |
                    Sort-Object Version -Descending | Select-Object -First 1
         }
@@ -230,13 +247,12 @@ function Test-ModuleAvailable {
 
 function Get-TenantAdminUrl {
     <#
-    .SYNOPSIS Construit l'URL du site d'administration SharePoint à partir du TenantId ou du domaine.
+    .SYNOPSIS Construit l'URL du site d'administration SharePoint.
     #>
     param([string]$Tenant)
 
-    # Si c'est un GUID, on ne peut pas construire l'URL directement
     if ($Tenant -match '^[0-9a-fA-F]{8}-') {
-        throw "Pour construire l'URL admin SharePoint, fournissez le domaine du tenant (ex: contoso.onmicrosoft.com) plutôt que le GUID."
+        throw "Fournissez le domaine du tenant (ex: contoso.onmicrosoft.com) plutôt que le GUID. Requis pour construire les URLs SharePoint."
     }
 
     $domain = $Tenant -replace '\.onmicrosoft\.com$', '' -replace '@', ''
@@ -249,6 +265,13 @@ function Get-SharePointRootUrl {
     return "https://$domain.sharepoint.com"
 }
 
+# BUG FIX : helper PS 5.1 pour remplacer l'opérateur ?? (PS 7+ uniquement)
+function Get-ValueOrDefault {
+    param($Value, $Default)
+    if ($null -ne $Value -and $Value -ne '') { return $Value }
+    return $Default
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2 : CONNEXION ET AUTHENTIFICATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -258,10 +281,9 @@ function Initialize-Connection {
     .SYNOPSIS
         Initialise la connexion à Microsoft 365 via PnP.PowerShell (préféré)
         ou Microsoft.Graph (fallback).
-    .DESCRIPTION
-        PnP.PowerShell offre des cmdlets natives SharePoint plus riches.
-        Microsoft.Graph couvre les mêmes données via l'API REST mais nécessite
-        plus d'appels. Le script détecte automatiquement la disponibilité.
+    .NOTES
+        BUG FIX : #Requires -Modules supprimé — la détection est faite ici à l'exécution,
+        pas au parsing, ce qui permet le fallback si PnP absent.
     #>
 
     Write-AuditLog "Vérification des modules disponibles..." 'INFO'
@@ -296,13 +318,14 @@ function Initialize-Connection {
             $secureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
             $credential   = New-Object System.Management.Automation.PSCredential($ClientId, $secureSecret)
 
+            # BUG FIX : -Scopes supprimé — invalide en app-only (client credentials).
+            # Les permissions viennent de l'app registration Azure AD (Sites.Read.All, etc.)
             Connect-MgGraph -TenantId $TenantId `
                             -ClientSecretCredential $credential `
-                            -Scopes "Sites.Read.All","Files.Read.All","User.Read.All" `
                             -ErrorAction Stop
 
             $Script:UsePnP = $false
-            Write-AuditLog "Connecté via Microsoft.Graph" 'SUCCESS'
+            Write-AuditLog "Connecté via Microsoft.Graph (app-only)" 'SUCCESS'
             return
         }
         catch {
@@ -315,6 +338,9 @@ function Initialize-Connection {
 Aucun module compatible trouvé. Installez l'un des suivants :
   Install-Module PnP.PowerShell -MinimumVersion 2.0 -Scope CurrentUser
   Install-Module Microsoft.Graph -Scope CurrentUser
+
+Documentation :
+  https://ayinedjimi-consultants.fr/articles/audit-partages-sharepoint-onedrive-powershell-anonymes
 "@
 }
 
@@ -331,10 +357,11 @@ function Get-AllSharePointSites {
     $sites = [System.Collections.Generic.List[PSObject]]::new()
 
     if ($Script:UsePnP) {
-        # PnP : Get-PnPTenantSite retourne tous les sites du tenant
         $rawSites = Invoke-WithRetry -OperationName "Get-PnPTenantSite" -ScriptBlock {
             Get-PnPTenantSite -IncludeOneDriveSites:$false -ErrorAction Stop
         }
+
+        if ($null -eq $rawSites) { return $sites }
 
         foreach ($s in $rawSites) {
             $sites.Add([PSCustomObject]@{
@@ -358,10 +385,13 @@ function Get-AllSharePointSites {
             if ($null -eq $response) { break }
 
             foreach ($s in $response.value) {
+                # BUG FIX : opérateur ternaire ? : remplacé (PS 7+ uniquement)
+                $tpl = if ($s.root) { "Root" } else { "Site" }
+
                 $sites.Add([PSCustomObject]@{
                     Url         = $s.webUrl
                     Title       = $s.displayName
-                    Template    = $s.root ? "Root" : "Site"
+                    Template    = $tpl
                     StorageUsed = 0
                     Type        = "SharePoint"
                     GraphId     = $s.id
@@ -386,11 +416,14 @@ function Get-AllOneDriveSites {
     $drives = [System.Collections.Generic.List[PSObject]]::new()
 
     if ($Script:UsePnP) {
+        # BUG FIX : filtrage côté client — la syntaxe -Filter PnP ne supporte pas -like sur URL
         $rawSites = Invoke-WithRetry -OperationName "Get-PnPTenantSite (OneDrive)" -ScriptBlock {
-            Get-PnPTenantSite -IncludeOneDriveSites -Filter "Url -like '-my.sharepoint.com/personal/'" -ErrorAction Stop
+            Get-PnPTenantSite -IncludeOneDriveSites -ErrorAction Stop
         }
 
-        foreach ($s in $rawSites) {
+        if ($null -eq $rawSites) { return $drives }
+
+        foreach ($s in $rawSites | Where-Object { $_.Url -like '*-my.sharepoint.com/personal/*' }) {
             $drives.Add([PSCustomObject]@{
                 Url         = $s.Url
                 Title       = $s.Title
@@ -401,7 +434,6 @@ function Get-AllOneDriveSites {
         }
     }
     else {
-        # Graph : énumère les utilisateurs puis leurs drives
         $usersLink = "https://graph.microsoft.com/v1.0/users?`$select=id,displayName,userPrincipalName&`$top=999"
 
         while ($usersLink) {
@@ -416,11 +448,16 @@ function Get-AllOneDriveSites {
                     Invoke-MgGraphRequest -Uri $driveUri -Method GET -ErrorAction SilentlyContinue
                 }
                 if ($drive -and $drive.webUrl) {
+                    $storageUsed = 0
+                    if ($drive.quota -and $drive.quota.used) {
+                        $storageUsed = [Math]::Round($drive.quota.used / 1MB, 2)
+                    }
+
                     $drives.Add([PSCustomObject]@{
                         Url         = $drive.webUrl
                         Title       = "$($user.displayName) - OneDrive"
                         Template    = "SPSPERS"
-                        StorageUsed = [Math]::Round($drive.quota.used / 1MB, 2)
+                        StorageUsed = $storageUsed
                         Type        = "OneDrive"
                         GraphId     = $drive.id
                         OwnerId     = $user.id
@@ -442,7 +479,6 @@ function Get-AllOneDriveSites {
 function Get-SharingsForSite {
     <#
     .SYNOPSIS Énumère récursivement tous les éléments d'un site et leurs liens de partage.
-    .PARAMETER Site PSObject retourné par Get-AllSharePointSites ou Get-AllOneDriveSites.
     #>
     param(
         [Parameter(Mandatory)]
@@ -450,16 +486,13 @@ function Get-SharingsForSite {
     )
 
     Write-Verbose "  → Analyse du site : $($Site.Url)"
-    $localResults = [System.Collections.Generic.List[PSObject]]::new()
 
     if ($Script:UsePnP) {
-        $localResults = Get-SharingsViaPnP -Site $Site
+        return Get-SharingsViaPnP -Site $Site
     }
     else {
-        $localResults = Get-SharingsViaGraph -Site $Site
+        return Get-SharingsViaGraph -Site $Site
     }
-
-    return $localResults
 }
 
 function Get-SharingsViaPnP {
@@ -474,7 +507,7 @@ function Get-SharingsViaPnP {
                               -ClientId $ClientId `
                               -ClientSecret $ClientSecret `
                               -ErrorAction Stop
-        }
+        } | Out-Null
 
         # Récupération de toutes les bibliothèques de documents
         $lists = Invoke-WithRetry -OperationName "Get-PnPList:$($Site.Url)" -ScriptBlock {
@@ -482,68 +515,100 @@ function Get-SharingsViaPnP {
                 Where-Object { $_.BaseType -eq "DocumentLibrary" -and -not $_.Hidden }
         }
 
+        if ($null -eq $lists) { return $results }
+
         foreach ($list in $lists) {
             Write-Verbose "    Bibliothèque : $($list.Title) ($($list.ItemCount) éléments)"
 
-            # Récupération des éléments avec champs de partage
-            $camlQuery = "<View Scope='RecursiveAll'><RowLimit>500</RowLimit></View>"
-            $items = Invoke-WithRetry -OperationName "Get-PnPListItem:$($list.Title)" -ScriptBlock {
-                Get-PnPListItem -List $list -Query $camlQuery `
-                                -Fields "FileRef","FileLeafRef","Editor","Modified","SMTotalFileCount" `
-                                -ErrorAction Stop
-            }
-
-            if ($null -eq $items) { continue }
-            $Script:Stats.TotalItems += $items.Count
-
-            foreach ($item in $items) {
-                # Récupération des informations de partage via l'API REST PnP
-                $itemUrl      = $item["FileRef"]
-                $sharingInfo  = Invoke-WithRetry -OperationName "Get-SharingInfo:$itemUrl" -ScriptBlock {
-                    Get-PnPFileSharingLink -FileUrl $itemUrl -ErrorAction SilentlyContinue
+            # BUG FIX : pagination CAML — on boucle jusqu'à épuisement des items
+            # sans pagination, seuls les 500 premiers items étaient analysés
+            $position = $null
+            do {
+                $pageItems = Invoke-WithRetry -OperationName "Get-PnPListItem:$($list.Title)" -ScriptBlock {
+                    $query = "<View Scope='RecursiveAll'><RowLimit>500</RowLimit></View>"
+                    $params = @{
+                        List   = $list
+                        Query  = $query
+                        Fields = @("FileRef","FileLeafRef","Editor","Modified")
+                        ErrorAction = 'Stop'
+                    }
+                    if ($position) { $params['ListItemCollectionPosition'] = $position }
+                    Get-PnPListItem @params
                 }
 
-                if ($null -eq $sharingInfo) { continue }
+                if ($null -eq $pageItems -or $pageItems.Count -eq 0) { break }
 
-                foreach ($link in $sharingInfo) {
-                    $shareType = switch -Wildcard ($link.Link.Scope) {
-                        "*anonymous*" { "Anyone" }
-                        "*organization*" { "Company" }
-                        default { "Specific" }
+                $Script:Stats.TotalItems += $pageItems.Count
+                $position = $pageItems.ListItemCollectionPosition
+
+                foreach ($item in $pageItems) {
+                    $itemUrl = $item["FileRef"]
+                    if (-not $itemUrl) { continue }
+
+                    # BUG FIX : Get-PnPFileSharingLink n'existe pas.
+                    # Utilisation de l'API REST PnP pour récupérer les SharingLinks.
+                    $restUrl   = "/_api/web/GetFileByServerRelativeUrl('{0}')/ListItemAllFields/SharingLinks" -f [uri]::EscapeDataString($itemUrl)
+                    $sharingInfo = Invoke-WithRetry -OperationName "REST:SharingLinks:$itemUrl" -ScriptBlock {
+                        Invoke-PnPSPRestMethod -Url $restUrl -Method Get -ErrorAction SilentlyContinue
                     }
 
-                    # Filtre si -AnonymousOnly
-                    if ($AnonymousOnly -and $shareType -ne "Anyone") { continue }
+                    if ($null -eq $sharingInfo -or $null -eq $sharingInfo.value) { continue }
 
-                    $isExpired = $false
-                    if ($link.ExpirationDateTime -and (Get-Date) -gt $link.ExpirationDateTime) {
-                        $isExpired = $true
-                        $Script:Stats.TotalExpired++
+                    foreach ($link in $sharingInfo.value) {
+                        $linkType  = if ($link.link) { $link.link.type } else { $link.type }
+                        $linkScope = if ($link.link) { $link.link.scope } else { $link.scope }
+                        $linkUrl   = if ($link.link) { $link.link.webUrl } else { $link.url }
+
+                        $shareType = switch -Wildcard ($linkScope) {
+                            "*anonymous*"    { "Anyone" }
+                            "*organization*" { "Company" }
+                            default          { "Specific" }
+                        }
+
+                        if ($AnonymousOnly -and $shareType -ne "Anyone") { continue }
+
+                        $isExpired    = $false
+                        $expDateTime  = $null
+                        if ($link.expirationDateTime) {
+                            $parsedDate = [datetime]::MinValue
+                            if ([datetime]::TryParse($link.expirationDateTime, [ref]$parsedDate)) {
+                                $expDateTime = $parsedDate
+                                if ((Get-Date) -gt $parsedDate) {
+                                    $isExpired = $true
+                                    $Script:Stats.TotalExpired++
+                                }
+                            }
+                        }
+
+                        # BUG FIX : remplacement de ?? par Get-ValueOrDefault (PS 5.1 compat.)
+                        $hasPassword = Get-ValueOrDefault -Value $link.requiresPassword -Default $false
+                        $createdBy   = Get-ValueOrDefault -Value $link.createdBy.user.displayName -Default "N/A"
+
+                        $entry = [PSCustomObject]@{
+                            SiteUrl          = $Site.Url
+                            SiteTitle        = $Site.Title
+                            SiteType         = $Site.Type
+                            ItemPath         = $itemUrl
+                            ItemName         = $item["FileLeafRef"]
+                            ShareType        = $shareType
+                            ShareUrl         = $linkUrl
+                            CreatedBy        = $createdBy
+                            CreatedDate      = $link.createdDateTime
+                            ExpirationDate   = $expDateTime
+                            IsExpired        = $isExpired
+                            IsAnonymous      = ($shareType -eq "Anyone")
+                            HasPassword      = $hasPassword
+                            Roles            = (Get-ValueOrDefault -Value ($link.roles -join "; ") -Default "")
+                            AuditTimestamp   = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                        }
+
+                        $results.Add($entry)
+                        $Script:Stats.TotalLinks++
+                        if ($shareType -eq "Anyone") { $Script:Stats.TotalAnonymous++ }
                     }
-
-                    $entry = [PSCustomObject]@{
-                        SiteUrl          = $Site.Url
-                        SiteTitle        = $Site.Title
-                        SiteType         = $Site.Type
-                        ItemPath         = $itemUrl
-                        ItemName         = $item["FileLeafRef"]
-                        ShareType        = $shareType
-                        ShareUrl         = $link.Link.WebUrl
-                        CreatedBy        = $link.GrantedToIdentitiesV2.User.DisplayName -join "; "
-                        CreatedDate      = $link.CreatedDateTime
-                        ExpirationDate   = $link.ExpirationDateTime
-                        IsExpired        = $isExpired
-                        IsAnonymous      = ($shareType -eq "Anyone")
-                        HasPassword      = $link.Link.PreventedBySensitivityLabel ?? $false
-                        Roles            = ($link.Roles -join "; ")
-                        AuditTimestamp   = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-                    }
-
-                    $results.Add($entry)
-                    $Script:Stats.TotalLinks++
-                    if ($shareType -eq "Anyone") { $Script:Stats.TotalAnonymous++ }
                 }
-            }
+
+            } while ($null -ne $position)
         }
     }
     catch {
@@ -560,19 +625,30 @@ function Get-SharingsViaGraph {
     $results = [System.Collections.Generic.List[PSObject]]::new()
 
     try {
-        # Résolution de l'ID de site Graph
         $siteId = $Site.GraphId
+
         if (-not $siteId) {
-            # On tente de résoudre via l'URL
-            $encoded = [uri]::EscapeDataString($Site.Url)
-            $lookup  = Invoke-WithRetry -OperationName "Graph:LookupSite" -ScriptBlock {
-                Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/sites?`$search=$encoded" -Method GET -ErrorAction Stop
+            # BUG FIX : résolution par URL via le format hostname:/path (pas $search avec URL encodée)
+            try {
+                $uri = [uri]$Site.Url
+                $hostname = $uri.Host
+                $path     = $uri.AbsolutePath.TrimEnd('/')
+                if (-not $path -or $path -eq '/') { $path = '/sites/root' }
+                $lookupUri = "https://graph.microsoft.com/v1.0/sites/$($hostname):$($path)"
+
+                $lookup = Invoke-WithRetry -OperationName "Graph:LookupSite:$($Site.Url)" -ScriptBlock {
+                    Invoke-MgGraphRequest -Uri $lookupUri -Method GET -ErrorAction Stop
+                }
+                $siteId = $lookup.id
             }
-            $siteId = $lookup.value[0].id
+            catch {
+                Write-AuditLog "Impossible de résoudre le site Graph pour $($Site.Url) : $_" 'WARN'
+                return $results
+            }
         }
 
         if (-not $siteId) {
-            Write-AuditLog "Impossible de résoudre le site Graph pour $($Site.Url)" 'WARN'
+            Write-AuditLog "ID de site introuvable pour $($Site.Url)" 'WARN'
             return $results
         }
 
@@ -581,8 +657,10 @@ function Get-SharingsViaGraph {
             Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/sites/$siteId/drives" -Method GET -ErrorAction Stop
         }
 
+        if ($null -eq $drivesResp) { return $results }
+
         foreach ($drive in $drivesResp.value) {
-            $results = Enumerate-GraphDriveItems -DriveId $drive.id -Site $Site -Results $results
+            Enumerate-GraphDriveItems -DriveId $drive.id -Site $Site -Results $results
         }
     }
     catch {
@@ -614,7 +692,7 @@ function Enumerate-GraphDriveItems {
 
             # Récursion dans les dossiers
             if ($item.folder) {
-                $Results = Enumerate-GraphDriveItems -DriveId $DriveId -Site $Site -Results $Results -FolderPath $item.id
+                Enumerate-GraphDriveItems -DriveId $DriveId -Site $Site -Results $Results -FolderPath $item.id
                 continue
             }
 
@@ -639,11 +717,23 @@ function Enumerate-GraphDriveItems {
 
                 if ($AnonymousOnly -and $shareType -ne "Anyone") { continue }
 
-                $isExpired = $false
-                if ($perm.expirationDateTime -and (Get-Date) -gt [datetime]$perm.expirationDateTime) {
-                    $isExpired = $true
-                    $Script:Stats.TotalExpired++
+                $isExpired   = $false
+                $expDateTime = $null
+                if ($perm.expirationDateTime) {
+                    $parsedDate = [datetime]::MinValue
+                    # BUG FIX : [datetime]::TryParse au lieu de cast direct (évite crash sur date malformée)
+                    if ([datetime]::TryParse($perm.expirationDateTime, [ref]$parsedDate)) {
+                        $expDateTime = $parsedDate
+                        if ((Get-Date) -gt $parsedDate) {
+                            $isExpired = $true
+                            $Script:Stats.TotalExpired++
+                        }
+                    }
                 }
+
+                # BUG FIX : remplacement de ?? par Get-ValueOrDefault (PS 5.1 compat.)
+                $createdBy   = Get-ValueOrDefault -Value $perm.grantedToV2.user.displayName -Default "N/A"
+                $hasPassword = Get-ValueOrDefault -Value $perm.link.preventsDownload -Default $false
 
                 $entry = [PSCustomObject]@{
                     SiteUrl          = $Site.Url
@@ -653,13 +743,13 @@ function Enumerate-GraphDriveItems {
                     ItemName         = $item.name
                     ShareType        = $shareType
                     ShareUrl         = $perm.link.webUrl
-                    CreatedBy        = ($perm.grantedToV2.user.displayName ?? "N/A")
+                    CreatedBy        = $createdBy
                     CreatedDate      = $perm.createdDateTime
-                    ExpirationDate   = $perm.expirationDateTime
+                    ExpirationDate   = $expDateTime
                     IsExpired        = $isExpired
                     IsAnonymous      = ($shareType -eq "Anyone")
-                    HasPassword      = ($null -ne $perm.link.preventsDownload)
-                    Roles            = ($perm.roles -join "; ")
+                    HasPassword      = $hasPassword
+                    Roles            = (Get-ValueOrDefault -Value ($perm.roles -join "; ") -Default "")
                     AuditTimestamp   = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
                 }
 
@@ -670,8 +760,6 @@ function Enumerate-GraphDriveItems {
         }
         $itemsUri = $resp.'@odata.nextLink'
     }
-
-    return $Results
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -679,61 +767,56 @@ function Enumerate-GraphDriveItems {
 # ─────────────────────────────────────────────────────────────────────────────
 
 function Export-ToCSV {
-    <#
-    .SYNOPSIS Exporte les résultats d'audit dans un fichier CSV.
-    #>
-
-    $timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $csvPath    = Join-Path $OutputPath "ShareAudit_$timestamp.csv"
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $csvPath   = Join-Path $OutputPath "ShareAudit_$timestamp.csv"
 
     Write-AuditLog "Export CSV : $csvPath" 'INFO'
-
-    $Script:SharingResults |
-        Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -Delimiter ";"
-
+    $Script:SharingResults | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -Delimiter ","
     Write-AuditLog "CSV exporté : $($Script:SharingResults.Count) entrées" 'SUCCESS'
     return $csvPath
 }
 
 function Export-ToHTML {
-    <#
-    .SYNOPSIS Génère un rapport HTML interactif avec tri, filtre et mise en couleur des risques.
-    #>
+    $timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $htmlPath   = Join-Path $OutputPath "ShareAudit_$timestamp.html"
+    $reportDate = Get-Date -Format 'dd/MM/yyyy HH:mm:ss'
+    $duration   = [Math]::Round(((Get-Date) - $Script:StartTime).TotalMinutes, 1)
 
-    $timestamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $htmlPath    = Join-Path $OutputPath "ShareAudit_$timestamp.html"
-    $reportDate  = Get-Date -Format 'dd/MM/yyyy HH:mm:ss'
-    $duration    = [Math]::Round(((Get-Date) - $Script:StartTime).TotalMinutes, 1)
-
-    # Top 10 des items les plus partagés
     $top10 = $Script:SharingResults |
         Group-Object ItemPath |
         Sort-Object Count -Descending |
         Select-Object -First 10 |
         ForEach-Object {
             $item = $_.Group[0]
-            "<tr><td>$($item.ItemName)</td><td>$($item.SiteTitle)</td><td>$($_.Count)</td><td><a href='$($item.ItemPath)' target='_blank'>Ouvrir</a></td></tr>"
+            "<tr><td>$([System.Web.HttpUtility]::HtmlEncode($item.ItemName))</td><td>$([System.Web.HttpUtility]::HtmlEncode($item.SiteTitle))</td><td>$($_.Count)</td><td><a href='$($item.ItemPath)' target='_blank'>Ouvrir</a></td></tr>"
         }
 
-    # Lignes du tableau principal
     $tableRows = $Script:SharingResults | ForEach-Object {
         $rowClass = if ($_.IsAnonymous) { "danger" } elseif ($_.SiteType -eq "OneDrive") { "warning" } else { "" }
-        $badge    = switch ($_.ShareType) {
+        $badge = switch ($_.ShareType) {
             "Anyone"   { "<span class='badge badge-danger'>Anyone</span>" }
             "Company"  { "<span class='badge badge-info'>Company</span>" }
             "Specific" { "<span class='badge badge-success'>Specific</span>" }
             default    { "<span class='badge badge-secondary'>$($_.ShareType)</span>" }
         }
-        $expired  = if ($_.IsExpired) { "<span class='badge badge-warning'>Expiré</span>" } else { "" }
+        $expired = if ($_.IsExpired) { "<span class='badge badge-warning'>Expiré</span>" } else { "" }
+
+        # BUG FIX : TryParse au lieu de cast direct pour les dates d'affichage HTML
+        $createdStr = "N/A"
+        if ($_.CreatedDate) {
+            $d = [datetime]::MinValue
+            if ([datetime]::TryParse($_.CreatedDate, [ref]$d)) { $createdStr = $d.ToString('dd/MM/yyyy') }
+        }
+        $expiresStr = if ($_.ExpirationDate) { $_.ExpirationDate.ToString('dd/MM/yyyy') } else { "Jamais" }
 
         "<tr class='$rowClass'>
-            <td>$($_.SiteTitle)</td>
+            <td>$([System.Web.HttpUtility]::HtmlEncode($_.SiteTitle))</td>
             <td>$($_.SiteType)</td>
-            <td title='$($_.ItemPath)'>$($_.ItemName)</td>
+            <td title='$($_.ItemPath)'>$([System.Web.HttpUtility]::HtmlEncode($_.ItemName))</td>
             <td>$badge $expired</td>
-            <td>$($_.CreatedBy)</td>
-            <td>$(if ($_.CreatedDate) { ([datetime]$_.CreatedDate).ToString('dd/MM/yyyy') } else { 'N/A' })</td>
-            <td>$(if ($_.ExpirationDate) { ([datetime]$_.ExpirationDate).ToString('dd/MM/yyyy') } else { 'Jamais' })</td>
+            <td>$([System.Web.HttpUtility]::HtmlEncode($_.CreatedBy))</td>
+            <td>$createdStr</td>
+            <td>$expiresStr</td>
             <td><a href='$($_.ShareUrl)' target='_blank'>Lien</a></td>
         </tr>"
     }
@@ -746,15 +829,15 @@ function Export-ToHTML {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Rapport Audit Partages M365 — $reportDate</title>
 <style>
-  :root { --red:#dc3545;--yellow:#ffc107;--green:#28a745;--blue:#007bff;--gray:#6c757d; }
-  body { font-family: 'Segoe UI', sans-serif; background:#f8f9fa; color:#212529; margin:0; }
+  :root { --red:#dc3545;--yellow:#ffc107;--green:#28a745;--blue:#0078d4;--gray:#6c757d; }
+  body { font-family:'Segoe UI',sans-serif; background:#f8f9fa; color:#212529; margin:0; }
   header { background:linear-gradient(135deg,#0078d4,#004578); color:#fff; padding:2rem; }
   header h1 { margin:0; font-size:1.8rem; }
   header p  { margin:.5rem 0 0; opacity:.8; }
   .container { max-width:1400px; margin:0 auto; padding:1.5rem; }
   .stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:1rem; margin:1.5rem 0; }
   .stat-card { background:#fff; border-radius:8px; padding:1.2rem; text-align:center; box-shadow:0 2px 4px rgba(0,0,0,.08); border-top:4px solid var(--blue); }
-  .stat-card.danger { border-top-color:var(--red); }
+  .stat-card.danger  { border-top-color:var(--red); }
   .stat-card.warning { border-top-color:var(--yellow); }
   .stat-card.success { border-top-color:var(--green); }
   .stat-value { font-size:2.5rem; font-weight:700; }
@@ -774,6 +857,10 @@ function Export-ToHTML {
   .badge-secondary { background:var(--gray); }
   #filterInput { width:100%; padding:.5rem .75rem; margin-bottom:1rem; border:1px solid #ced4da; border-radius:4px; font-size:.95rem; }
   .section-title { font-size:1.2rem; font-weight:600; color:#004578; margin:2rem 0 1rem; border-left:4px solid #0078d4; padding-left:.75rem; }
+  .resources { background:#fff; border-radius:8px; padding:1.5rem; box-shadow:0 2px 4px rgba(0,0,0,.08); margin-top:2rem; }
+  .resources h3 { color:#004578; margin-top:0; }
+  .resources a { color:#0078d4; text-decoration:none; display:block; margin:.3rem 0; }
+  .resources a:hover { text-decoration:underline; }
   footer { text-align:center; padding:1.5rem; color:var(--gray); font-size:.8rem; border-top:1px solid #dee2e6; margin-top:2rem; }
   a { color:#0078d4; }
 </style>
@@ -807,7 +894,7 @@ function Export-ToHTML {
       <div class="stat-label">Liens expirés</div>
     </div>
     <div class="stat-card success">
-      <div class="stat-value">$($Script:Stats.Errors)</div>
+      <div class="stat-value" style="color:$(if ($Script:Stats.Errors -gt 0) {'var(--red)'} else {'var(--green)'})">$($Script:Stats.Errors)</div>
       <div class="stat-label">Erreurs</div>
     </div>
   </div>
@@ -819,48 +906,60 @@ function Export-ToHTML {
   </table>
 
   <div class="section-title">Tous les partages détectés</div>
-  <input id="filterInput" type="text" placeholder="Filtrer par nom, site, type..." onkeyup="filterTable()">
-  <table id="mainTable">
+  <input id="filterInput" type="text" placeholder="Filtrer par nom, site, type..." oninput="filterTable()">
+  <table id="mainTable" data-sort-dir="">
     <thead>
       <tr>
-        <th onclick="sortTable(0)">Site</th>
-        <th onclick="sortTable(1)">Type</th>
-        <th onclick="sortTable(2)">Élément</th>
-        <th onclick="sortTable(3)">Partage</th>
-        <th onclick="sortTable(4)">Créé par</th>
-        <th onclick="sortTable(5)">Date création</th>
-        <th onclick="sortTable(6)">Expiration</th>
+        <th onclick="sortTable(0)">Site ↕</th>
+        <th onclick="sortTable(1)">Type ↕</th>
+        <th onclick="sortTable(2)">Élément ↕</th>
+        <th onclick="sortTable(3)">Partage ↕</th>
+        <th onclick="sortTable(4)">Créé par ↕</th>
+        <th onclick="sortTable(5)">Date création ↕</th>
+        <th onclick="sortTable(6)">Expiration ↕</th>
         <th>Lien</th>
       </tr>
     </thead>
     <tbody id="tableBody">$($tableRows -join "`n")</tbody>
   </table>
 
+  <div class="resources">
+    <h3>Ressources complémentaires</h3>
+    <a href="https://ayinedjimi-consultants.fr/articles/audit-partages-sharepoint-onedrive-powershell-anonymes" target="_blank">Guide complet : Audit des partages SharePoint & OneDrive avec PowerShell</a>
+    <a href="https://ayinedjimi-consultants.fr/articles/audit-securite-microsoft-365-guide" target="_blank">Audit de sécurité Microsoft 365 — méthodologie complète</a>
+    <a href="https://ayinedjimi-consultants.fr/articles/forensique-microsoft-365-unified-audit-log" target="_blank">Forensique Microsoft 365 — Unified Audit Log</a>
+    <a href="https://ayinedjimi-consultants.fr/articles/entra-id-azure-ad-securite-configuration" target="_blank">Sécurisation Entra ID / Azure AD</a>
+    <a href="https://ayinedjimi-consultants.fr/articles/identity-governance-iga-cycle-vie-comptes" target="_blank">Identity Governance — cycle de vie des comptes</a>
+    <a href="https://github.com/ayinedjimi/sharepoint-onedrive-share-audit" target="_blank">Repo GitHub — sharepoint-onedrive-share-audit</a>
+  </div>
+
 </div>
 <footer>
   Généré par <strong>Get-ShareAudit.ps1 v$($Script:Version)</strong> —
   <a href="https://ayinedjimi-consultants.fr/articles/audit-partages-sharepoint-onedrive-powershell-anonymes">
     Guide complet sur ayinedjimi-consultants.fr
-  </a>
+  </a> |
+  <a href="https://github.com/ayinedjimi/sharepoint-onedrive-share-audit">GitHub</a>
 </footer>
 <script>
 function filterTable() {
   const q = document.getElementById('filterInput').value.toLowerCase();
-  document.querySelectorAll('#tableBody tr').forEach(row => {
-    row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+  document.querySelectorAll('#tableBody tr').forEach(function(row) {
+    row.style.display = row.textContent.toLowerCase().indexOf(q) >= 0 ? '' : 'none';
   });
 }
 function sortTable(col) {
-  const table = document.getElementById('mainTable');
-  const rows  = Array.from(table.querySelectorAll('tbody tr'));
-  const asc   = table.dataset.sortDir !== 'asc';
+  var table = document.getElementById('mainTable');
+  var rows  = Array.prototype.slice.call(table.querySelectorAll('tbody tr'));
+  var asc   = table.dataset.sortDir !== 'asc';
   table.dataset.sortDir = asc ? 'asc' : 'desc';
-  rows.sort((a, b) => {
-    const x = a.cells[col]?.textContent.trim() ?? '';
-    const y = b.cells[col]?.textContent.trim() ?? '';
-    return asc ? x.localeCompare(y) : y.localeCompare(x);
+  rows.sort(function(a, b) {
+    var x = (a.cells[col] ? a.cells[col].textContent.trim() : '');
+    var y = (b.cells[col] ? b.cells[col].textContent.trim() : '');
+    return asc ? x.localeCompare(y, 'fr') : y.localeCompare(x, 'fr');
   });
-  rows.forEach(r => table.querySelector('tbody').appendChild(r));
+  var tbody = table.querySelector('tbody');
+  rows.forEach(function(r) { tbody.appendChild(r); });
 }
 </script>
 </body>
@@ -886,20 +985,19 @@ function Show-Summary {
     Write-Host "  RÉSUMÉ DE L'AUDIT — Get-ShareAudit.ps1 v$Script:Version" -ForegroundColor Cyan
     Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "  Durée totale        : $duration minutes" -ForegroundColor White
-    Write-Host "  Sites analysés      : $($Script:Stats.TotalSites)" -ForegroundColor White
-    Write-Host "  Éléments scannés    : $($Script:Stats.TotalItems)" -ForegroundColor White
-    Write-Host "  Liens de partage    : $($Script:Stats.TotalLinks)" -ForegroundColor White
+    Write-Host "  Durée totale        : $duration minutes"         -ForegroundColor White
+    Write-Host "  Sites analysés      : $($Script:Stats.TotalSites)"    -ForegroundColor White
+    Write-Host "  Éléments scannés    : $($Script:Stats.TotalItems)"    -ForegroundColor White
+    Write-Host "  Liens de partage    : $($Script:Stats.TotalLinks)"    -ForegroundColor White
     Write-Host "  Liens ANONYMES      : $($Script:Stats.TotalAnonymous)" -ForegroundColor $(if ($Script:Stats.TotalAnonymous -gt 0) { 'Red' } else { 'Green' })
-    Write-Host "  Liens expirés       : $($Script:Stats.TotalExpired)" -ForegroundColor Yellow
-    Write-Host "  Erreurs             : $($Script:Stats.Errors)" -ForegroundColor $(if ($Script:Stats.Errors -gt 0) { 'Red' } else { 'Green' })
+    Write-Host "  Liens expirés       : $($Script:Stats.TotalExpired)"  -ForegroundColor Yellow
+    Write-Host "  Erreurs             : $($Script:Stats.Errors)"        -ForegroundColor $(if ($Script:Stats.Errors -gt 0) { 'Red' } else { 'Green' })
     Write-Host ""
 
-    if ($CsvPath)  { Write-Host "  Export CSV  : $CsvPath"  -ForegroundColor Cyan }
-    if ($HtmlPath) { Write-Host "  Rapport HTML: $HtmlPath" -ForegroundColor Cyan }
+    if ($CsvPath)  { Write-Host "  Export CSV   : $CsvPath"  -ForegroundColor Cyan }
+    if ($HtmlPath) { Write-Host "  Rapport HTML : $HtmlPath" -ForegroundColor Cyan }
     Write-Host ""
 
-    # Top 10 dans la console
     $top10 = $Script:SharingResults |
         Group-Object ItemPath |
         Sort-Object Count -Descending |
@@ -909,18 +1007,21 @@ function Show-Summary {
         Write-Host "  TOP 10 — ÉLÉMENTS LES PLUS PARTAGÉS :" -ForegroundColor Yellow
         $top10 | ForEach-Object {
             $item = $_.Group[0]
-            Write-Host "    $($_.Count.ToString().PadLeft(4)) liens — $($item.ItemName) [$($item.SiteTitle)]" -ForegroundColor White
+            Write-Host ("    {0} liens — {1} [{2}]" -f $_.Count.ToString().PadLeft(4), $item.ItemName, $item.SiteTitle) -ForegroundColor White
         }
         Write-Host ""
     }
 
     if ($Script:Stats.TotalAnonymous -gt 0) {
-        Write-Host "  ⚠  ATTENTION : $($Script:Stats.TotalAnonymous) lien(s) anonyme(s) détecté(s) !" -ForegroundColor Red
-        Write-Host "     Ces liens sont accessibles SANS authentification." -ForegroundColor Red
-        Write-Host "     Révoquez-les immédiatement ou appliquez une politique de gouvernance." -ForegroundColor Red
+        Write-Host "  ATTENTION : $($Script:Stats.TotalAnonymous) lien(s) anonyme(s) détecté(s) !" -ForegroundColor Red
+        Write-Host "  Ces liens sont accessibles SANS authentification." -ForegroundColor Red
+        Write-Host "  Guide de remédiation : https://ayinedjimi-consultants.fr/articles/audit-partages-sharepoint-onedrive-powershell-anonymes" -ForegroundColor Yellow
         Write-Host ""
     }
 
+    Write-Host "  Documentation : https://ayinedjimi-consultants.fr/articles/audit-partages-sharepoint-onedrive-powershell-anonymes" -ForegroundColor Gray
+    Write-Host "  GitHub        : https://github.com/ayinedjimi/sharepoint-onedrive-share-audit" -ForegroundColor Gray
+    Write-Host ""
     Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
     Write-Host ""
 }
@@ -932,59 +1033,52 @@ function Show-Summary {
 function Main {
     Write-Host ""
     Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "  Get-ShareAudit.ps1 v$Script:Version — Audit Partages M365" -ForegroundColor Cyan
-    Write-Host "  ayinedjimi-consultants.fr — Cybersécurité Microsoft 365" -ForegroundColor Gray
+    Write-Host "  Get-ShareAudit.ps1 v$Script:Version — Audit Partages M365"   -ForegroundColor Cyan
+    Write-Host "  ayinedjimi-consultants.fr — Cybersécurité Microsoft 365"      -ForegroundColor Gray
+    Write-Host "  https://github.com/ayinedjimi/sharepoint-onedrive-share-audit" -ForegroundColor Gray
     Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
     Write-Host ""
 
-    # Validation du dossier de sortie
     if (-not (Test-Path $OutputPath)) {
         Write-AuditLog "Création du dossier de sortie : $OutputPath" 'INFO'
         New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
     }
 
-    # Connexion
     Initialize-Connection
 
-    # Collecte des sites
     $allSites = [System.Collections.Generic.List[PSObject]]::new()
 
     $spSites = Get-AllSharePointSites
-    $spSites | ForEach-Object { $allSites.Add($_) }
+    foreach ($s in $spSites) { $allSites.Add($s) }
 
     if ($IncludeOneDrive) {
         $odSites = Get-AllOneDriveSites
-        $odSites | ForEach-Object { $allSites.Add($_) }
+        foreach ($s in $odSites) { $allSites.Add($s) }
     }
 
     $Script:Stats.TotalSites = $allSites.Count
     Write-AuditLog "Total sites à analyser : $($allSites.Count)" 'INFO'
 
-    # Analyse de chaque site avec barre de progression
     $siteIndex = 0
     foreach ($site in $allSites) {
         $siteIndex++
-        $pct = [Math]::Round(($siteIndex / $allSites.Count) * 100)
+        $pct = [Math]::Round(($siteIndex / [Math]::Max($allSites.Count, 1)) * 100)
 
         Write-Progress -Activity "Audit des partages M365" `
                        -Status "Site $siteIndex/$($allSites.Count) : $($site.Title)" `
-                       -PercentComplete $pct `
-                       -CurrentOperation "Analyse en cours..."
+                       -PercentComplete $pct
 
         $siteResults = Get-SharingsForSite -Site $site
-        $siteResults | ForEach-Object { $Script:SharingResults.Add($_) }
+        foreach ($r in $siteResults) { $Script:SharingResults.Add($r) }
     }
 
     Write-Progress -Activity "Audit des partages M365" -Completed
 
-    # Exports
     $csvPath  = Export-ToCSV
     $htmlPath = Export-ToHTML
 
-    # Résumé
     Show-Summary -CsvPath $csvPath -HtmlPath $htmlPath
 
-    # Déconnexion propre
     if ($Script:UsePnP) {
         Disconnect-PnPOnline -ErrorAction SilentlyContinue
     }
@@ -995,5 +1089,4 @@ function Main {
     Write-AuditLog "Audit terminé." 'SUCCESS'
 }
 
-# Lancement
 Main
